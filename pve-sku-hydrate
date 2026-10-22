@@ -1,0 +1,220 @@
+#!/usr/bin/python3
+"""pve-sku-hydrate: copy each Proxmox VM's name, VM ID and tags into the VM's SMBIOS type1 fields, so the guest (and any
+tool running in it) can tell which Proxmox VM it is.
+
+Runs on ONE Proxmox node and covers the whole cluster through `pvesh`, so new nodes and new VMs are picked up
+automatically. Meant to run from cron (hourly); it only writes values that changed.
+
+  SMBIOS type1 field   value                        inside a Linux guest
+  sku                  VM name                      /sys/class/dmi/id/product_sku
+  serial               VM ID                        /sys/class/dmi/id/product_serial   (root only)
+  family               tags, comma separated        /sys/class/dmi/id/product_family
+
+Details:
+- Values are written with `base64=1`: Proxmox accepts only base64 characters in plain smbios1 values (no '.', '-',
+  ' ', ','). The guest sees the decoded text. The VM's uuid and any other smbios1 field are kept.
+- SMBIOS changes on a running VM are pending until Proxmox starts the VM again (stop/start, or reboot from Proxmox;
+  a reboot from inside the guest does not apply them).
+- So that the values are usable right away, Linux VMs with a running QEMU guest agent also get (only when changed):
+    META_FILE        VMID / NAME / TAGS as KEY=VALUE lines (prefix PVE_)
+    DMI_SCRIPT_FILE  bind-mounts files with the new values over /sys/class/dmi/id/product_{sku,serial,family}
+                     until the next VM start (sysfs itself is read-only); mounts nothing once the real DMI matches
+    CRON_FILE        runs DMI_SCRIPT_FILE @reboot (covers a reboot from inside the guest)
+  `dmidecode` reads the raw firmware table and shows the new values only after the next VM start.
+- Windows VMs (ostype win*, w2k*, wxp, wvista) are not touched (SMBIOS changes can trigger re-activation). Templates
+  are skipped. Containers (LXC) have no SMBIOS.
+- Tags matching EXCLUDE_TAGS are left out (root in the guest can read DMI: keep internal tags out).
+
+Usage: pve-sku-hydrate [--dry] [--vmid N] [--exclude-tags 'PATTERN ...'] [--config FILE]
+  --exclude-tags  space separated glob patterns of tags to leave out (overrides EXCLUDE_TAGS in the config),
+                  e.g. --exclude-tags 'billing-* internal-*'
+Config: /etc/default/pve-sku-hydrate (KEY=VALUE, see the defaults below).
+"""
+import base64, concurrent.futures, fnmatch, hashlib, json, os, re, shlex, subprocess, sys, time
+
+DEFAULTS = {
+    'META_FILE': '/etc/pve-sku/meta',             # in-guest paths
+    'DMI_SCRIPT_FILE': '/etc/pve-sku/dmi.sh',
+    'CRON_FILE': '/etc/cron.d/pve-sku-dmi',
+    'EXCLUDE_TAGS': '',                           # space separated glob patterns, e.g. "billing-* internal-*"
+    'SKIP_OSTYPE_REGEX': r'^(win|w2k|wxp|wvista)',
+    'IN_GUEST': '1',                              # 0 = SMBIOS only, never write inside guests
+    'WORKERS': '8',                               # VMs handled in parallel (each pvesh call loads the PVE API)
+    'STATE_FILE': '/var/lib/pve-sku-hydrate/state.json',
+}
+FIELDS = ('manufacturer', 'product', 'version', 'serial', 'sku', 'family')
+
+
+def load_config(path):
+    cfg = dict(DEFAULTS)
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    k, v = line.split('=', 1)
+                    v = shlex.split(v)[0] if v.strip() else ''
+                    if k.strip() in cfg:
+                        cfg[k.strip()] = v
+    except OSError:
+        pass
+    return cfg
+
+
+def pvesh(*args):
+    r = subprocess.run(['pvesh'] + list(args) + ['--output-format', 'json'], capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        msg = (r.stderr or r.stdout or '').strip().splitlines()
+        raise RuntimeError(msg[-1][:200] if msg else 'pvesh exit %d' % r.returncode)
+    try:
+        return json.loads(r.stdout) if r.stdout.strip() else None
+    except ValueError:  # some calls (e.g. config set) print plain text on success
+        return None
+
+
+def b64(s):
+    return base64.b64encode(s.encode()).decode()
+
+
+def smbios_plain(s):
+    """smbios1 string -> (uuid, {field: plain text})"""
+    d = dict(p.split('=', 1) for p in (s or '').split(',') if '=' in p)
+    enc = d.pop('base64', '0') in ('1', 'true')
+    uuid = d.pop('uuid', None)
+    out = {}
+    for k, v in d.items():
+        try:
+            out[k] = base64.b64decode(v).decode() if enc else v
+        except Exception:  # noqa: BLE001
+            out[k] = v
+    return uuid, out
+
+
+def smbios_string(uuid, plain):
+    parts = (['uuid=' + uuid] if uuid else []) + ['base64=1']
+    parts += ['%s=%s' % (k, b64(plain[k])) for k in FIELDS if plain.get(k)]
+    return ','.join(parts)
+
+
+def agent_enabled(vmcfg):
+    a = str(vmcfg.get('agent', '0'))
+    return a.split(',')[0] in ('1', 'enabled=1') or 'enabled=1' in a
+
+
+def dmi_script(meta_file):
+    return r'''#!/bin/sh
+# pve-sku-hydrate: show the Proxmox VM name / ID / tags (%(meta)s) in /sys/class/dmi/id until the next VM start.
+# After that start the real DMI (SMBIOS type1) holds them and nothing is mounted. Runs again @reboot.
+. %(meta)s
+d=/run/pve-sku-dmi; mkdir -p $d; chmod 755 $d
+for kv in "product_sku=$PVE_NAME" "product_serial=$PVE_VMID" "product_family=$PVE_TAGS"; do
+  f=${kv%%%%=*}; v=${kv#*=}; t=/sys/class/dmi/id/$f
+  [ -e $t ] || continue
+  grep -q " $(readlink -f $t) " /proc/mounts && umount $t 2>/dev/null
+  [ "$(cat $t 2>/dev/null)" = "$v" ] && continue
+  printf '%%s\n' "$v" > $d/$f
+  if [ $f = product_serial ]; then chmod 400 $d/$f; else chmod 444 $d/$f; fi
+  mount --bind $d/$f $t
+done
+''' % {'meta': meta_file}
+
+
+def process(r, cfg, state, dry):
+    """One VM -> (log lines, smbios changed 0/1, guest written 0/1, new state hash or None)."""
+    out, node, vmid, name = [], r['node'], r['vmid'], r.get('name') or ''
+    vmcfg = pvesh('get', '/nodes/%s/qemu/%s/config' % (node, vmid))  # includes pending values
+    if re.match(cfg['SKIP_OSTYPE_REGEX'], str(vmcfg.get('ostype', ''))):
+        return [], 0, 0, None
+    excl = cfg['EXCLUDE_TAGS'].split()
+    tags = [t for t in re.split(r'[;, ]+', vmcfg.get('tags') or '') if t and not any(fnmatch.fnmatch(t, p) for p in excl)]
+    uuid, cur = smbios_plain(vmcfg.get('smbios1'))
+    want = dict(cur, sku=name, serial=str(vmid), family=','.join(tags))
+    if not want['family']:
+        want.pop('family')
+    changed = 0
+    if {k: cur.get(k) for k in FIELDS} != {k: want.get(k) for k in FIELDS}:
+        out.append('%s %s: smbios1 %s -> sku=%s serial=%s family=%s%s' % (
+            vmid, name, 'would be set' if dry else 'set', want['sku'], want['serial'], want.get('family', ''),
+            ' (applies at the next VM start)' if r.get('status') == 'running' else ''))
+        if not dry:
+            pvesh('set', '/nodes/%s/qemu/%s/config' % (node, vmid), '--smbios1', smbios_string(uuid, want))
+        changed = 1
+    if cfg['IN_GUEST'] != '1' or r.get('status') != 'running' or not agent_enabled(vmcfg):
+        return out, changed, 0, None
+    meta = ('# pve-sku-hydrate: Proxmox identity of this VM, rewritten when it changes. The same values are in DMI\n'
+            '# after the next VM start: /sys/class/dmi/id/product_sku, product_serial, product_family\n'
+            'PVE_VMID=%s\nPVE_NAME=%s\nPVE_TAGS=%s\n' % (vmid, name, ','.join(tags)))
+    script = dmi_script(cfg['META_FILE'])
+    cron = ('# pve-sku-hydrate: re-apply the DMI view after a reboot from inside the VM\n@reboot root sh %s\n'
+            % cfg['DMI_SCRIPT_FILE'])
+    h = hashlib.sha256((meta + script + cron).encode()).hexdigest()[:16]
+    if state.get(str(vmid)) == h:
+        return out, changed, 0, None
+    osinfo = (pvesh('get', '/nodes/%s/qemu/%s/agent/get-osinfo' % (node, vmid)) or {}).get('result') or {}
+    if osinfo.get('id') == 'mswindows' or 'windows' in str(osinfo.get('name', '')).lower():
+        return out, changed, 0, None
+    if dry:
+        return out + ['%s %s: would write %s inside the guest' % (vmid, name, cfg['META_FILE'])], changed, 0, None
+    api = '/nodes/%s/qemu/%s/agent/' % (node, vmid)
+    for d in sorted({os.path.dirname(cfg['META_FILE']), os.path.dirname(cfg['DMI_SCRIPT_FILE'])}):
+        try:
+            pvesh('create', api + 'exec', '--command', 'mkdir', '--command', d)
+        except RuntimeError:
+            pass  # exists; file-write reports a real problem
+    # a new file (new inode): log shippers that tail the file see a rewrite as new content
+    try:
+        pvesh('create', api + 'exec', '--command', 'rm', '--command', cfg['META_FILE'])
+    except RuntimeError:
+        pass
+    time.sleep(1)
+    for path, text in ((cfg['META_FILE'], meta), (cfg['DMI_SCRIPT_FILE'], script), (cfg['CRON_FILE'], cron)):
+        pvesh('create', api + 'file-write', '--file', path, '--content', text)
+    pvesh('create', api + 'exec', '--command', 'sh', '--command', cfg['DMI_SCRIPT_FILE'])
+    return out + ['%s %s: guest files written, DMI view updated until the next VM start' % (vmid, name)], changed, 1, h
+
+
+def safe(r, cfg, state, dry):
+    """process() for one VM; an error on one VM never stops the run"""
+    try:
+        return process(r, cfg, state, dry)
+    except Exception as e:  # noqa: BLE001
+        return ['%s %s: %s (retry next run)' % (r.get('vmid'), r.get('name'), str(e)[:150])], 0, 0, None
+
+
+def main():
+    a = sys.argv[1:]
+    if '-h' in a or '--help' in a:
+        print(__doc__)
+        return
+    dry = '--dry' in a
+    only = int(a[a.index('--vmid') + 1]) if '--vmid' in a else None
+    cfg = load_config(a[a.index('--config') + 1] if '--config' in a else '/etc/default/pve-sku-hydrate')
+    if '--exclude-tags' in a:
+        cfg['EXCLUDE_TAGS'] = a[a.index('--exclude-tags') + 1]
+    try:
+        state = json.load(open(cfg['STATE_FILE']))
+    except (OSError, ValueError):
+        state = {}
+    t0 = time.time()
+    vms = [r for r in pvesh('get', '/cluster/resources', '--type', 'vm')
+           if r.get('type') == 'qemu' and not r.get('template') and (not only or r['vmid'] == only)]
+    changed = written = 0
+    with concurrent.futures.ThreadPoolExecutor(max(1, int(cfg['WORKERS']))) as ex:
+        for r, (lines, c, w, h) in zip(vms, ex.map(lambda v: safe(v, cfg, state, dry), vms)):
+            for line in lines:
+                print(line)
+            changed += c
+            written += w
+            if h:
+                state[str(r['vmid'])] = h
+    if not dry:
+        os.makedirs(os.path.dirname(cfg['STATE_FILE']), exist_ok=True)
+        with open(cfg['STATE_FILE'], 'w') as f:
+            json.dump(state, f)
+    print('%s: %d VMs checked in %d s, %d smbios1 %s, %d guests updated%s' % (
+        time.strftime('%Y-%m-%dT%H:%M:%S'), len(vms), time.time() - t0, changed, 'to change' if dry else 'changed',
+        written, ' (dry run)' if dry else ''))
+
+
+if __name__ == '__main__':
+    main()

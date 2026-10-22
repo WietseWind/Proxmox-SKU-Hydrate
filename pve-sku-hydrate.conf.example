@@ -1,0 +1,23 @@
+# /etc/default/pve-sku-hydrate - configuration for pve-sku-hydrate (KEY=VALUE, shell-style quoting).
+# All keys are optional; the values below are the defaults.
+
+# Files written inside Linux guests (through the QEMU guest agent) when the values change.
+#META_FILE=/etc/pve-sku/meta
+#DMI_SCRIPT_FILE=/etc/pve-sku/dmi.sh
+#CRON_FILE=/etc/cron.d/pve-sku-dmi
+
+# Tags to leave out of the SMBIOS family field and the guest file (space separated glob patterns).
+# Root inside a guest can read DMI, so keep internal tags (pricing, owner notes, ...) out, e.g.:
+#EXCLUDE_TAGS="billing-* internal-*"
+#EXCLUDE_TAGS=""
+
+# VMs whose ostype matches this regex are not touched at all (SMBIOS changes can trigger Windows re-activation).
+#SKIP_OSTYPE_REGEX='^(win|w2k|wxp|wvista)'
+
+# 0 = only set SMBIOS in the VM config; never write inside guests.
+#IN_GUEST=1
+
+# VMs handled in parallel (each pvesh call loads the Proxmox API, ~1-2 s).
+#WORKERS=8
+
+#STATE_FILE=/var/lib/pve-sku-hydrate/state.json
