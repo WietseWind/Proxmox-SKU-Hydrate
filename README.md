@@ -154,3 +154,7 @@ real SMBIOS values become active at the next start from Proxmox; until then they
 **How do I remove it?** `sh install.sh --uninstall` removes the script, cron job and logrotate entry. The SMBIOS values
 stay in the VM configs (clear them in *Options → SMBIOS settings*), and the guest files stay in the guests (remove
 `META_FILE`, `DMI_SCRIPT_FILE` and `CRON_FILE`; the bind mounts disappear at the next guest reboot).
+
+## License
+
+MIT, see [LICENSE](LICENSE).
