@@ -147,7 +147,8 @@ def process(r, cfg, state, dry):
     script = dmi_script(cfg['META_FILE'])
     cron = ('# pve-sku-hydrate: re-apply the DMI view after a reboot from inside the VM\n@reboot root sh %s\n'
             % cfg['DMI_SCRIPT_FILE'])
-    h = hashlib.sha256((meta + script + cron).encode()).hexdigest()[:16]
+    # 'v2': files written before 2026-10-23 have mode 0666 (see the chmod below) and must be written again once
+    h = hashlib.sha256(('v2\n' + meta + script + cron).encode()).hexdigest()[:16]
     if state.get(str(vmid)) == h:
         return out, changed, 0, None
     osinfo = (pvesh('get', '/nodes/%s/qemu/%s/agent/get-osinfo' % (node, vmid)) or {}).get('result') or {}
@@ -158,7 +159,7 @@ def process(r, cfg, state, dry):
     api = '/nodes/%s/qemu/%s/agent/' % (node, vmid)
     for d in sorted({os.path.dirname(cfg['META_FILE']), os.path.dirname(cfg['DMI_SCRIPT_FILE'])}):
         try:
-            pvesh('create', api + 'exec', '--command', 'mkdir', '--command', d)
+            pvesh('create', api + 'exec', '--command', 'mkdir', '--command', '-m', '--command', '0755', '--command', d)
         except RuntimeError:
             pass  # exists; file-write reports a real problem
     # a new file (new inode): log shippers that tail the file see a rewrite as new content
@@ -169,6 +170,10 @@ def process(r, cfg, state, dry):
     time.sleep(1)
     for path, text in ((cfg['META_FILE'], meta), (cfg['DMI_SCRIPT_FILE'], script), (cfg['CRON_FILE'], cron)):
         pvesh('create', api + 'file-write', '--file', path, '--content', text)
+    # the guest agent creates files with mode 0666: other users could change a script that root runs, and cron
+    # refuses a group/other-writable file in /etc/cron.d ("INSECURE MODE")
+    pvesh('create', api + 'exec', '--command', 'chmod', '--command', '0644', '--command', cfg['META_FILE'],
+          '--command', cfg['DMI_SCRIPT_FILE'], '--command', cfg['CRON_FILE'])
     pvesh('create', api + 'exec', '--command', 'sh', '--command', cfg['DMI_SCRIPT_FILE'])
     return out + ['%s %s: guest files written, DMI view updated until the next VM start' % (vmid, name)], changed, 1, h
 

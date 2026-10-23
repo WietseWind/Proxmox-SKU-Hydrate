@@ -137,6 +137,9 @@ Log: `/var/log/pve-sku-hydrate.log`. State (what was last written into each gues
 - Everything you put in a VM's name or tags becomes visible to root inside that VM. Use `EXCLUDE_TAGS` for internal
   tags.
 - The in-guest files can be changed by root in the guest; the DMI values cannot. Trust DMI for anything that matters.
+- The in-guest files are written with mode `0644` (the guest agent itself creates files as `0666`; versions before
+  2026-10-23 left them that way, and cron ignored the `@reboot` file as "INSECURE MODE"). The first run of a fixed
+  version rewrites them once on every guest.
 - The script runs as root on the Proxmox node and writes into guests through the guest agent (`file-write` / `exec`),
   like `qm guest exec` does.
 - If a security tool (file integrity monitoring) watches `/etc` in your guests, exclude `META_FILE`,
